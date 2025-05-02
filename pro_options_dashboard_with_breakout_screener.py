@@ -8,6 +8,7 @@ import yfinance as yf
 import numpy as np
 import re
 import requests
+import time
 
 # ===============================================
 # Page Config
@@ -22,31 +23,36 @@ refresh_time = st.sidebar.slider("Refresh Interval (seconds)", 10, 300, 60)
 # Helper Functions
 # ===============================================
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def load_fno_symbols():
+    """Load NSE F&O symbols dynamically from the web or fallback to local CSV."""
     try:
-        fno_list = pd.read_csv("nse_fno_list.csv")
-        fno_list.columns = fno_list.columns.str.strip().str.upper()
-        if 'SYMBOL' not in fno_list.columns:
-            st.error("Error: 'SYMBOL' column not found in FNO list.")
-            st.stop()
-        symbols = fno_list['SYMBOL'].dropna().unique().tolist()
-        
-        # Clean: remove anything except letters and numbers
-        clean_symbols = []
-        for sym in symbols:
-            sym = re.sub(r'[^A-Za-z0-9]', '', sym)  # Remove non-alphanumerics
-            if sym:
-                clean_symbols.append(sym)
-        return clean_symbols
-    except FileNotFoundError:
-        st.error("Error: 'nse_fno_list.csv' file not found.")
-        st.stop()
+        nse_url = "https://www.nseindia.com/api/liveEquity-derivatives?index=stock_fno"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        session = requests.Session()
+        session.headers.update(headers)
+        res = session.get(nse_url, timeout=10)
+        data = res.json()
+        symbols = [item['symbol'] for item in data['data']]
+        if not symbols:
+            raise ValueError("No symbols from live NSE. Falling back.")
     except Exception as e:
-        st.error(f"Unexpected error loading FNO symbols: {e}")
-        st.stop()
+        st.warning(f"Live NSE F&O fetch failed: {e}")
+        try:
+            fallback_df = pd.read_csv("nse_fno_list.csv")
+            fallback_df.columns = fallback_df.columns.str.strip().str.upper()
+            if 'SYMBOL' not in fallback_df.columns:
+                raise ValueError("SYMBOL column missing in fallback CSV.")
+            symbols = fallback_df['SYMBOL'].astype(str).str.strip().dropna().unique().tolist()
+        except Exception as ex:
+            st.error(f"Failed loading F&O symbols from fallback: {ex}")
+            return []
 
-@st.cache_data(ttl=300)
+    clean_symbols = [re.sub(r'[^A-Za-z0-9]', '', sym).upper() for sym in symbols if sym]
+    return sorted(set(clean_symbols))
+
+
+@st.cache_data(ttl=600)
 def validate_symbols(symbols):
     """Filter only valid Yahoo Finance symbols"""
     valid_symbols = []
@@ -56,9 +62,13 @@ def validate_symbols(symbols):
             hist = ticker.history(period="1d")
             if not hist.empty:
                 valid_symbols.append(symbol)
-        except:
-            pass
+        except Exception as e:
+            st.warning(f"Validation error for {symbol}: {e}")
+        time.sleep(0.1)
+    if not valid_symbols:
+        st.error("❌ No valid symbols found. Check internet or symbol list.")
     return valid_symbols
+
 
 @st.cache_data(ttl=300)
 def get_breakout_screener(symbols):
@@ -93,6 +103,7 @@ def get_breakout_screener(symbols):
     df = pd.DataFrame(breakout_data, columns=["Stock", "Current Price", "20 EMA", "Prev High", "Prev Low", "Signal"])
     return df
 
+
 def highlight_signal(val):
     if isinstance(val, str):
         if "Above" in val:
@@ -100,6 +111,7 @@ def highlight_signal(val):
         elif "Below" in val:
             return 'background-color: lightcoral; font-weight: bold'
     return ''
+
 
 @st.cache_data(ttl=300)
 def fetch_option_chain(symbol):
@@ -135,11 +147,13 @@ def fetch_option_chain(symbol):
 # Load Valid Symbols
 # ===============================================
 
-st.info("Loading FNO symbols and validating against Yahoo Finance...")
+st.info("⏳ Loading F&O symbols. Please wait...")
+
 symbols = load_fno_symbols()
+st.write("🔍 Raw Symbols Preview:", symbols[:10])
 symbols = validate_symbols(symbols)
 
-st.success(f"Loaded {len(symbols)} valid F&O symbols.")
+st.success(f"✅ {len(symbols)} valid F&O symbols loaded.")
 
 # ===============================================
 # Dashboard Layout
@@ -164,14 +178,14 @@ st.dataframe(
 
 st.divider()
 
-# --- Section 2: Top 5 Options Screener (Intraday & Monthly) ---
+# --- Section 2: Top 5 Options Screener ---
 st.header("🔥 Top 5 Stock Options Screener")
 
 option_screener = []
 
 for idx, row in top_breakouts.iterrows():
     spot_price = row['Current Price']
-    strike_price = round(spot_price / 50) * 50  # Round to nearest 50 strike
+    strike_price = round(spot_price / 50) * 50
     option_type = "CALL" if "Above" in row['Signal'] else "PUT"
     stop_loss = round(spot_price * 0.98, 2) if option_type == "CALL" else round(spot_price * 1.02, 2)
     expiry_type = "Weekly (Intraday)" if spot_price < 1000 else "Monthly"
@@ -210,8 +224,8 @@ st.header("🧠 Event/News Based Options Strategies")
 
 st.subheader("🎯 Examples:")
 st.markdown("""
-- **Before Budget or RBI Policy**: ATM Straddle or Strangle
-- **Ahead of Quarterly Results**: Covered Call or Protective Put
+- **Before Budget or RBI Policy**: ATM Straddle or Strangle  
+- **Ahead of Quarterly Results**: Covered Call or Protective Put  
 - **Volatile Events (e.g., Elections)**: Iron Condor, Calendar Spread
 """)
 
@@ -222,4 +236,3 @@ st.info("👉 Strategy recommendations based on event dates coming soon!")
 # ===============================================
 
 st.info("🔄 Note: Please manually refresh (Ctrl+R) for latest data. Streamlit doesn't auto-refresh automatically.")
-
