@@ -9,6 +9,8 @@ import numpy as np
 import re
 import requests
 import time
+import random
+import os
 
 # ===============================================
 # Page Config
@@ -23,52 +25,79 @@ refresh_time = st.sidebar.slider("Refresh Interval (seconds)", 10, 300, 60)
 # Helper Functions
 # ===============================================
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300)
 def load_fno_symbols():
-    """Load NSE F&O symbols dynamically from the web or fallback to local CSV."""
     try:
-        nse_url = "https://www.nseindia.com/api/liveEquity-derivatives?index=stock_fno"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        session = requests.Session()
-        session.headers.update(headers)
-        res = session.get(nse_url, timeout=10)
-        data = res.json()
-        symbols = [item['symbol'] for item in data['data']]
-        if not symbols:
-            raise ValueError("No symbols from live NSE. Falling back.")
+        fno_list = pd.read_csv("nse_fno_list.csv")
+        fno_list.columns = fno_list.columns.str.strip().str.upper()
+        if 'SYMBOL' not in fno_list.columns:
+            st.error("Error: 'SYMBOL' column not found in FNO list.")
+            st.stop()
+        symbols = fno_list['SYMBOL'].dropna().unique().tolist()
+
+        # Clean: remove anything except letters and numbers
+        clean_symbols = []
+        for sym in symbols:
+            sym = re.sub(r'[^A-Za-z0-9]', '', sym)  # Remove non-alphanumerics
+            if sym:
+                clean_symbols.append(sym)
+        return clean_symbols
+    except FileNotFoundError:
+        st.error("Error: 'nse_fno_list.csv' file not found.")
+        st.stop()
     except Exception as e:
-        st.warning(f"Live NSE F&O fetch failed: {e}")
+        st.error(f"Unexpected error loading FNO symbols: {e}")
+        st.stop()
+
+@st.cache_data(ttl=300)
+def validate_symbols(symbols, max_retries=3, delay=0.75, backup_file="validated_symbols.csv"):
+    """Validate Yahoo symbols with rate-limit handling + backup caching."""
+
+    if os.path.exists(backup_file):
         try:
-            fallback_df = pd.read_csv("nse_fno_list.csv")
-            fallback_df.columns = fallback_df.columns.str.strip().str.upper()
-            if 'SYMBOL' not in fallback_df.columns:
-                raise ValueError("SYMBOL column missing in fallback CSV.")
-            symbols = fallback_df['SYMBOL'].astype(str).str.strip().dropna().unique().tolist()
-        except Exception as ex:
-            st.error(f"Failed loading F&O symbols from fallback: {ex}")
-            return []
-
-    clean_symbols = [re.sub(r'[^A-Za-z0-9]', '', sym).upper() for sym in symbols if sym]
-    return sorted(set(clean_symbols))
-
-
-@st.cache_data(ttl=600)
-def validate_symbols(symbols):
-    """Filter only valid Yahoo Finance symbols"""
-    valid_symbols = []
-    for symbol in symbols:
-        try:
-            ticker = yf.Ticker(symbol + ".NS")
-            hist = ticker.history(period="1d")
-            if not hist.empty:
-                valid_symbols.append(symbol)
+            cached = pd.read_csv(backup_file)
+            cached_symbols = cached['SYMBOL'].dropna().unique().tolist()
+            st.success(f"Loaded {len(cached_symbols)} cached validated symbols.")
+            return cached_symbols
         except Exception as e:
-            st.warning(f"Validation error for {symbol}: {e}")
-        time.sleep(0.1)
-    if not valid_symbols:
-        st.error("❌ No valid symbols found. Check internet or symbol list.")
-    return valid_symbols
+            st.warning(f"Backup cache failed to load: {e}. Rebuilding...")
 
+    st.info("Running validation (may take time due to rate limits)...")
+    valid_symbols = []
+
+    for symbol in symbols:
+        retries = 0
+        success = False
+        curr_delay = delay
+
+        while retries < max_retries:
+            try:
+                ticker = yf.Ticker(symbol + ".NS")
+                hist = ticker.history(period="1d")
+                if not hist.empty:
+                    valid_symbols.append(symbol)
+                    success = True
+                    break
+            except Exception as e:
+                if "too many requests" in str(e).lower():
+                    st.warning(f"Rate limited on {symbol}. Retrying in {curr_delay:.1f}s...")
+                    time.sleep(curr_delay)
+                    curr_delay *= 1.5
+                    retries += 1
+                else:
+                    st.warning(f"Validation error for {symbol}: {e}")
+                    break
+
+        time.sleep(random.uniform(0.5, 1.0))
+
+    if valid_symbols:
+        try:
+            pd.DataFrame({"SYMBOL": valid_symbols}).to_csv(backup_file, index=False)
+            st.success(f"Saved validated symbols to {backup_file}")
+        except Exception as e:
+            st.warning(f"Failed to write backup: {e}")
+
+    return valid_symbols
 
 @st.cache_data(ttl=300)
 def get_breakout_screener(symbols):
@@ -103,7 +132,6 @@ def get_breakout_screener(symbols):
     df = pd.DataFrame(breakout_data, columns=["Stock", "Current Price", "20 EMA", "Prev High", "Prev Low", "Signal"])
     return df
 
-
 def highlight_signal(val):
     if isinstance(val, str):
         if "Above" in val:
@@ -111,7 +139,6 @@ def highlight_signal(val):
         elif "Below" in val:
             return 'background-color: lightcoral; font-weight: bold'
     return ''
-
 
 @st.cache_data(ttl=300)
 def fetch_option_chain(symbol):
@@ -147,13 +174,11 @@ def fetch_option_chain(symbol):
 # Load Valid Symbols
 # ===============================================
 
-st.info("⏳ Loading F&O symbols. Please wait...")
-
+st.info("Loading FNO symbols and validating against Yahoo Finance...")
 symbols = load_fno_symbols()
-st.write("🔍 Raw Symbols Preview:", symbols[:10])
 symbols = validate_symbols(symbols)
 
-st.success(f"✅ {len(symbols)} valid F&O symbols loaded.")
+st.success(f"Loaded {len(symbols)} valid F&O symbols.")
 
 # ===============================================
 # Dashboard Layout
@@ -178,7 +203,7 @@ st.dataframe(
 
 st.divider()
 
-# --- Section 2: Top 5 Options Screener ---
+# --- Section 2: Top 5 Options Screener (Intraday & Monthly) ---
 st.header("🔥 Top 5 Stock Options Screener")
 
 option_screener = []
@@ -189,7 +214,7 @@ for idx, row in top_breakouts.iterrows():
     option_type = "CALL" if "Above" in row['Signal'] else "PUT"
     stop_loss = round(spot_price * 0.98, 2) if option_type == "CALL" else round(spot_price * 1.02, 2)
     expiry_type = "Weekly (Intraday)" if spot_price < 1000 else "Monthly"
-    
+
     option_screener.append({
         "Stock": row['Stock'],
         "Option Type": option_type,
@@ -220,16 +245,16 @@ if selected_stock:
 st.divider()
 
 # --- Section 4: Event or News Based Strategies ---
-st.header("🧠 Event/News Based Options Strategies")
+st.header("🧐 Event/News Based Options Strategies")
 
 st.subheader("🎯 Examples:")
 st.markdown("""
-- **Before Budget or RBI Policy**: ATM Straddle or Strangle  
-- **Ahead of Quarterly Results**: Covered Call or Protective Put  
+- **Before Budget or RBI Policy**: ATM Straddle or Strangle
+- **Ahead of Quarterly Results**: Covered Call or Protective Put
 - **Volatile Events (e.g., Elections)**: Iron Condor, Calendar Spread
 """)
 
-st.info("👉 Strategy recommendations based on event dates coming soon!")
+st.info("🔭 Strategy recommendations based on event dates coming soon!")
 
 # ===============================================
 # Footer
